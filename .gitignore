@@ -1,0 +1,8 @@
+# Lake build artifacts and downloaded dependencies
+/.lake/
+
+# Language server and Lean workspace cache
+/.elan/
+/.lean/
+
+raft.pdf

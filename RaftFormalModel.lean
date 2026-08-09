@@ -70,22 +70,6 @@ def newNode (id : Nat) : NodeState :=
     h_commit_bounds := by rfl
   }
 
--- helper for RPC.requestReply handler.
-def becomeLeader (node : NodeState) (clusterIds : List Nat) : NodeState :=
-  let lastLogIndex      := node.persist.log.length
-  let initialNextIndex  := clusterIds.map (fun id => (id, lastLogIndex + 1))
-  let initialMatchIndex := clusterIds.map (fun id => (id, 0))
-  { node with
-    volatile := { node.volatile with
-      role := Role.leader,
-      leaderState := some {
-        nextIndex := initialNextIndex,
-        matchIndex := initialMatchIndex
-      }
-    },
-    h_commit_bounds := node.h_commit_bounds
-  }
-
 -------------------------------------------------
 -- STEP 2: THE APPEND-ENTRIES RPC & LOGIC
 -------------------------------------------------
@@ -98,7 +82,8 @@ inductive RPC
                   (prevLogTerm : Nat)
                   (entries : Log)
                   (leaderCommit : Nat)
-  | appendReply   (term : Nat)
+  | appendReply   (followerId : Nat)
+                  (term : Nat)
                   (success : Bool)
                   (matchIndex : Nat)
   | requestVote   (node : NodeState)
@@ -146,6 +131,87 @@ def handleAppendEntries
          },
          h_commit_bounds := by grind
       }, true)
+
+-- Helper: Recursively find the highest log index that has been replicated to a majority
+-- of the cluster AND belongs to the current term.
+def findNewCommitIndex (log : Log) (matchIdxMap : PeerMap) (clusterIds : List Nat)
+                       (leaderId : Nat) (currentTerm : Nat) (commitIndex : Nat)
+                       (N : Nat) (majority : Nat) : Nat :=
+  if N <= commitIndex then
+    commitIndex -- We've hit the old commit index; nothing new to commit.
+  else
+    -- Tally how many nodes have replicated at least up to index N
+    let count := clusterIds.foldl (fun c id =>
+      if id == leaderId then
+        c + 1 -- The leader always has its own entries
+      else if PeerMap.get matchIdxMap id 0 >= N then
+        c + 1
+      else
+        c
+    ) 0
+    -- Check if the entry at N belongs to the current term
+    -- (Log is 0-indexed, so absolute length N is index N-1)
+    let isCurrentTerm := match log[N - 1]? with
+                         | some entry => entry.term == currentTerm
+                         | none       => false
+    if count >= majority && isCurrentTerm then
+      N -- Found the new highest commit index!
+    else
+      -- Step down and try the next index
+      findNewCommitIndex log matchIdxMap clusterIds leaderId
+                         currentTerm commitIndex (N - 1) majority
+
+def handleAppendReply (node : NodeState) (clusterIds : List Nat)
+  (followerId : Nat) (replyTerm : Nat) (success : Bool) (matchIdx : Nat) : NodeState :=
+  -- Phase 1: Term Progression
+  -- If a follower has a higher term, the leader is deposed.
+  if replyTerm > node.persist.currentTerm then
+    { node with
+      persist := { node.persist with
+        currentTerm := replyTerm,
+        votedFor    := none
+      },
+      volatile := { node.volatile with
+        role         := Role.follower,
+        votesGranted := 0,
+        leaderState  := none
+      },
+      h_commit_bounds := node.h_commit_bounds
+    }
+
+  -- Phase 2: Stale Reply or Invalid Role Check
+  else if replyTerm < node.persist.currentTerm || node.volatile.role != Role.leader then
+    node
+
+  -- Phase 3: Update LeaderState and calculate new CommitIndex
+  else
+    match node.volatile.leaderState with
+    | none => node -- Should mathematically never happen if role is leader
+    | some ls =>
+        let newLs :=
+          if success then
+            { matchIndex := PeerMap.set ls.matchIndex followerId matchIdx,
+              nextIndex  := PeerMap.set ls.nextIndex followerId (matchIdx + 1) }
+          else
+            -- If append failed, decrement nextIndex so we can retry with an older prefix
+            let currentNext := PeerMap.get ls.nextIndex followerId 1
+            let decremented := if currentNext > 1 then currentNext - 1 else 1
+            { ls with nextIndex := PeerMap.set ls.nextIndex followerId decremented }
+
+        -- Phase 4: See if we can advance the commitIndex
+        let majority := (clusterIds.length / 2) + 1
+        let proposedCommit := findNewCommitIndex
+                                node.persist.log newLs.matchIndex clusterIds node.id
+                                node.persist.currentTerm node.volatile.commitIndex
+                                node.persist.log.length majority
+
+        { node with
+          volatile := { node.volatile with
+            leaderState := some newLs,
+            commitIndex := proposedCommit
+          },
+          h_commit_bounds := by sorry
+        }
 
 ------------------------------------------------------------
 -- STEP 3: THE LOCAL INDUCTIVE PROOF (SAFETY GUARANTEE)
@@ -230,6 +296,21 @@ def handleRequestVote (node : NodeState) (candidateId : Nat) (candidateTerm : Na
     else
       (node', false)
 
+def becomeLeader (node : NodeState) (clusterIds : List Nat) : NodeState :=
+  let lastLogIndex      := node.persist.log.length
+  let initialNextIndex  := clusterIds.map (fun id => (id, lastLogIndex + 1))
+  let initialMatchIndex := clusterIds.map (fun id => (id, 0))
+  { node with
+    volatile := { node.volatile with
+      role := Role.leader,
+      leaderState := some {
+        nextIndex := initialNextIndex,
+        matchIndex := initialMatchIndex
+      }
+    },
+    h_commit_bounds := node.h_commit_bounds
+  }
+
 -- Processes a RequestReply (vote response) and returns the updated NodeState.
 -- We pass in clusterIds so we can calculate the majority and initialize the leader state.
 def handleRequestReply (node : NodeState) (clusterIds : List Nat)
@@ -276,26 +357,44 @@ def handleRequestReply (node : NodeState) (clusterIds : List Nat)
 def process_rpc (w : NetworkWorld) (targetNode : NodeState) (packet : Packet) : NetworkWorld :=
   match packet.payload with
   | RPC.appendEntries t leaderId pIdx pTerm entries leaderCommit =>
-      let (updatedNode, _) :=
-        handleAppendEntries targetNode t leaderId pIdx pTerm entries leaderCommit
-      { w with  -- Use 'w with' to preserve w.clusterIds automatically
-        nodes    := updateNode w.nodes updatedNode,
-        inflight := w.inflight.filter (· != packet) }
-  | RPC.requestVote node candidateId candidateTerm lastLogIdx lastLogTerm =>
+      -- 1. Process the local state change and extract the success boolean
       let (updatedNode, success) :=
-        handleRequestVote node candidateId candidateTerm lastLogIdx lastLogTerm
-      if success = true then
-        { w with
-          nodes    := updateNode w.nodes updatedNode,
-          inflight := w.inflight.filter (· != packet) }
-      else w
+        handleAppendEntries targetNode t leaderId pIdx pTerm entries leaderCommit
+      -- 2. Calculate the matchIndex to report back to the leader
+      let matchIdx := if success then pIdx + entries.length else 0
+      -- 3. Construct the reply packet directed back to the leader
+      let replyPacket : Packet := {
+        payload := RPC.appendReply targetNode.id updatedNode.persist.currentTerm success matchIdx,
+        destId  := leaderId
+      }
+      -- 4. Update the world state: save the node, drop the old packet, add the new packet
+      { w with
+        nodes    := updateNode w.nodes updatedNode,
+        inflight := replyPacket :: w.inflight.filter (· != packet) }
+  | RPC.requestVote _ candidateId candidateTerm lastLogIdx lastLogTerm =>
+      -- 1. Process the local state change (using targetNode, not the payload's node)
+      let (updatedNode, success) :=
+        handleRequestVote targetNode candidateId candidateTerm lastLogIdx lastLogTerm
+      -- 2. Construct the vote reply packet directed back to the candidate
+      let replyPacket : Packet := {
+        payload := RPC.requestReply updatedNode.persist.currentTerm success,
+        destId  := candidateId
+      }
+      -- 3. Update the world state
+      { w with
+        nodes    := updateNode w.nodes updatedNode,
+        inflight := replyPacket :: w.inflight.filter (· != packet) }
   | RPC.requestReply replyTerm voteGranted =>
-      -- Pass w.clusterIds into handleRequestReply to calculate the majority
       let updatedNode := handleRequestReply targetNode w.clusterIds replyTerm voteGranted
       { w with
         nodes    := updateNode w.nodes updatedNode,
         inflight := w.inflight.filter (· != packet) }
-  | _ => w -- Handle other RPCs (if added later) here
+  | RPC.appendReply followerId replyTerm success matchIdx =>
+      let updatedNode :=
+        handleAppendReply targetNode w.clusterIds followerId replyTerm success matchIdx
+      { w with
+        nodes    := updateNode w.nodes updatedNode,
+        inflight := w.inflight.filter (· != packet) }
 
 -- The Global Transition: Pluck ONE message from the soup and process it
 -- This is how we model asynchronous, out-of-order delivery.

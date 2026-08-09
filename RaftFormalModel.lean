@@ -12,12 +12,6 @@ structure LogEntry where
 
 abbrev Log := List LogEntry
 
-structure PersistentState where
-  currentTerm : Nat
-  votedFor    : Option Nat
-  log         : Log
-  deriving Repr, DecidableEq
-
 inductive Role
   | follower
   | candidate
@@ -39,16 +33,23 @@ structure LeaderState where
   nextIndex  : PeerMap
   deriving Repr, DecidableEq
 
+structure PersistentState where
+  currentTerm : Nat
+  votedFor    : Option Nat
+  log         : Log
+  deriving Repr, DecidableEq
+
 structure VolatileState where
   commitIndex : Nat
   role        : Role
   leaderState : Option LeaderState
+  votesGranted : Nat
   deriving Repr, DecidableEq
 
 structure NodeState where
-  persist : PersistentState
-  volatile  : VolatileState
-  id          : Nat
+  volatile : VolatileState
+  persist  : PersistentState
+  id       : Nat
   h_commit_bounds : volatile.commitIndex ≤ persist.log.length
   deriving Repr, DecidableEq
 
@@ -57,20 +58,22 @@ def newNode (id : Nat) : NodeState :=
     id  := id,
     persist := {
       currentTerm := 0,
-      log := [],
-      votedFor := none,
+      log         := [],
+      votedFor    := none,
     },
     volatile := {
       commitIndex := 0,
-      role := Role.follower,
+      role        := .follower,
       leaderState := none,
+      votesGranted := 0,
     },
     h_commit_bounds := by rfl
   }
 
+-- helper for RPC.requestReply handler.
 def becomeLeader (node : NodeState) (clusterIds : List Nat) : NodeState :=
-  let lastLogIndex := node.persist.log.length
-  let initialNextIndex := clusterIds.map (fun id => (id, lastLogIndex + 1))
+  let lastLogIndex      := node.persist.log.length
+  let initialNextIndex  := clusterIds.map (fun id => (id, lastLogIndex + 1))
   let initialMatchIndex := clusterIds.map (fun id => (id, 0))
   { node with
     volatile := { node.volatile with
@@ -103,7 +106,8 @@ inductive RPC
                   (candidateTerm : Nat)
                   (lastLogIdx : Nat)
                   (lastLogTerm : Nat)
-  | requestReply
+  | requestReply  (term : Nat)
+                  (voteGranted : Bool)
   deriving Repr, DecidableEq
 
 -- The Follower's Logic: Returns (NewState, ReplyMessage)
@@ -173,6 +177,7 @@ structure Packet where
 structure NetworkWorld where
   inflight : List Packet   -- "The Soup" (Non-deterministic, unordered)
   nodes    : Nat → Option NodeState
+  clusterIds : List Nat
 
 -- Helper: Update a specific node in the cluster
 def updateNode (worldNodes : Nat → Option NodeState) (newNode : NodeState) :
@@ -225,21 +230,72 @@ def handleRequestVote (node : NodeState) (candidateId : Nat) (candidateTerm : Na
     else
       (node', false)
 
+-- Processes a RequestReply (vote response) and returns the updated NodeState.
+-- We pass in clusterIds so we can calculate the majority and initialize the leader state.
+def handleRequestReply (node : NodeState) (clusterIds : List Nat)
+  (replyTerm : Nat) (voteGranted : Bool) : NodeState :=
+  -- Phase 1: Term Progression
+  -- If the reply contains a term greater than ours, we are out of date.
+  -- Step down immediately to follower and update our term.
+  if replyTerm > node.persist.currentTerm then
+    { node with
+      persist := { node.persist with
+        currentTerm := replyTerm,
+        votedFor    := none
+      },
+      volatile := { node.volatile with
+        role         := Role.follower,
+        votesGranted := 0
+      }
+    }
+  -- Phase 2: Stale Reply or Invalid Role Check
+  -- If the reply is for an older term, or we are no longer a candidate
+  -- (e.g., we already won or lost), just ignore the message.
+  else if replyTerm < node.persist.currentTerm || node.volatile.role != Role.candidate then
+    node
+  -- Phase 3: Tallying Votes
+  else if voteGranted then
+    let newVoteCount := node.volatile.votesGranted + 1
+    let majority := (clusterIds.length / 2) + 1
+    -- Did we reach a majority?
+    if newVoteCount >= majority then
+      -- We won the election! Upgrade to Leader.
+      becomeLeader node clusterIds
+    else
+      -- Still waiting for more votes, just record this one.
+      { node with
+        volatile := { node.volatile with
+          votesGranted := newVoteCount
+        }
+      }
+  -- Phase 4: Vote Denied
+  -- If the vote wasn't granted, our state doesn't change.
+  else
+    node
+
 def process_rpc (w : NetworkWorld) (targetNode : NodeState) (packet : Packet) : NetworkWorld :=
   match packet.payload with
   | RPC.appendEntries t leaderId pIdx pTerm entries leaderCommit =>
       let (updatedNode, _) :=
         handleAppendEntries targetNode t leaderId pIdx pTerm entries leaderCommit
-      { nodes    := updateNode w.nodes updatedNode,
+      { w with  -- Use 'w with' to preserve w.clusterIds automatically
+        nodes    := updateNode w.nodes updatedNode,
         inflight := w.inflight.filter (· != packet) }
   | RPC.requestVote node candidateId candidateTerm lastLogIdx lastLogTerm =>
       let (updatedNode, success) :=
         handleRequestVote node candidateId candidateTerm lastLogIdx lastLogTerm
       if success = true then
-        { nodes    := updateNode w.nodes updatedNode,
+        { w with
+          nodes    := updateNode w.nodes updatedNode,
           inflight := w.inflight.filter (· != packet) }
       else w
-  | _ => w -- Handle Votes, etc., here later
+  | RPC.requestReply replyTerm voteGranted =>
+      -- Pass w.clusterIds into handleRequestReply to calculate the majority
+      let updatedNode := handleRequestReply targetNode w.clusterIds replyTerm voteGranted
+      { w with
+        nodes    := updateNode w.nodes updatedNode,
+        inflight := w.inflight.filter (· != packet) }
+  | _ => w -- Handle other RPCs (if added later) here
 
 -- The Global Transition: Pluck ONE message from the soup and process it
 -- This is how we model asynchronous, out-of-order delivery.
@@ -328,7 +384,8 @@ theorem raft_step_safe_pIdx_zero
   (h : targetNode.volatile.commitIndex ≤ entries.length)
   (h_append : { volatile := { commitIndex := targetNode.volatile.commitIndex,
                               role := targetNode.volatile.role,
-                              leaderState := targetNode.volatile.leaderState },
+                              leaderState := targetNode.volatile.leaderState,
+                              votesGranted := targetNode.volatile.votesGranted },
                 persist := {
                   currentTerm := t,
                   log := List.take 0 targetNode.persist.log ++ entries,
@@ -366,7 +423,7 @@ theorem handleAppendEntries_preserves_LogMatching
   (t leaderId pIdx pTerm leaderCommit : ℕ)
   (entries : Log)
   (payload : pkt.payload = RPC.appendEntries t leaderId pIdx pTerm entries leaderCommit) :
-  LogMatchingInvariant {
+  LogMatchingInvariant { w with
     inflight := List.filter (fun x ↦ x != pkt) w.inflight,
     nodes := updateNode w.nodes
              (handleAppendEntries targetNode t leaderId pIdx pTerm entries leaderCommit).1
@@ -383,7 +440,8 @@ theorem handleAppendEntries_preserves_NetworkMatching
   (entries : Log)
   (payload : pkt.payload = RPC.appendEntries t leaderId pIdx pTerm entries leaderCommit) :
   NetworkMatchingInvariant
-    { inflight := List.filter (fun x ↦ x != pkt) w.inflight,
+    { w with
+      inflight := List.filter (fun x ↦ x != pkt) w.inflight,
       nodes := updateNode w.nodes
                (handleAppendEntries targetNode t leaderId pIdx pTerm entries leaderCommit).1 } := by
       sorry
